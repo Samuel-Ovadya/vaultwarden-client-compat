@@ -52,6 +52,7 @@ jobs:
             ca-certificates \
             curl \
             jq \
+            libnss3-tools \
             nginx \
             openssl
 
@@ -61,6 +62,7 @@ jobs:
           set -Eeuo pipefail
 
           VAULTWARDEN_TLS_DIR="${RUNNER_TEMP}/vaultwarden-tls"
+          NSS_DB="${HOME}/.pki/nssdb"
 
           mkdir -p "${VAULTWARDEN_TLS_DIR}"
           chmod 700 "${VAULTWARDEN_TLS_DIR}"
@@ -107,12 +109,39 @@ jobs:
 
           chmod 600 "${VAULTWARDEN_TLS_DIR}/"*.key
 
-          # Install the temporary CA into the runner's system trust store.
+          # Install the temporary CA into the system trust store.
           sudo cp \
             "${VAULTWARDEN_TLS_DIR}/ca.crt" \
             /usr/local/share/ca-certificates/vaultwarden-lifecycle-ca.crt
 
           sudo update-ca-certificates
+
+          # Chromium on Linux uses an NSS Shared Certificate Database.
+          # Create the database if it does not already exist.
+          mkdir -p "${NSS_DB}"
+
+          if [ ! -f "${NSS_DB}/cert9.db" ]; then
+            certutil -d "sql:${NSS_DB}" -N --empty-password
+          fi
+
+          # Import the temporary CA as a trusted SSL CA.
+          certutil \
+            -d "sql:${NSS_DB}" \
+            -A \
+            -t "C,," \
+            -n "Vaultwarden Lifecycle Test CA" \
+            -i "${VAULTWARDEN_TLS_DIR}/ca.crt"
+
+          # Verify that the certificate is present.
+          certutil -d "sql:${NSS_DB}" -L
+
+          if ! certutil -d "sql:${NSS_DB}" -L |
+            grep -Fq "Vaultwarden Lifecycle Test CA"; then
+            echo "Temporary CA was not imported into NSS."
+            exit 1
+          fi
+
+          echo "Temporary CA installed in system and Chromium trust stores."
 
           # Resolve the test hostname to loopback.
           echo "127.0.0.1 ${VAULTWARDEN_HOSTNAME}" | sudo tee -a /etc/hosts
@@ -207,8 +236,6 @@ jobs:
             -verify_hostname "${VAULTWARDEN_HOSTNAME}" \
             </dev/null
 
-          echo "Checking HTTPS response..."
-
           HTTP_STATUS="$(curl \
             --silent \
             --output /dev/null \
@@ -227,7 +254,6 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          # The official Web Vault must be served by Vaultwarden.
           WEB_STATUS="$(curl \
             --silent \
             --output /dev/null \
@@ -257,11 +283,9 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          # Credentials exist only on this GitHub-hosted runner.
           BW_EMAIL="canary-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$(openssl rand -hex 4)@example.invalid"
           BW_PASSWORD="Aa1!$(openssl rand -hex 24)"
 
-          # Prevent accidental disclosure in GitHub Actions logs.
           echo "::add-mask::${BW_EMAIL}"
           echo "::add-mask::${BW_PASSWORD}"
 
@@ -281,7 +305,6 @@ jobs:
 
           mkdir -p "${PROVISIONING_DIR}"
 
-          # Install exact versions of the official CLI and Playwright.
           npm install \
             --prefix "${PROVISIONING_DIR}" \
             --no-save \
@@ -335,7 +358,6 @@ jobs:
               waitUntil: 'domcontentloaded'
             });
 
-            // Wait for the registration interface.
             const emailInput = page.locator(
               'input[type="email"], input[autocomplete="email"]'
             ).first();
@@ -359,7 +381,6 @@ jobs:
             await passwordInputs.nth(0).fill(password);
             await passwordInputs.nth(1).fill(password);
 
-            // Observe the actual registration API response.
             const registrationResponsePromise = page.waitForResponse(
               response =>
                 new URL(response.url()).pathname.endsWith(
@@ -407,10 +428,8 @@ jobs:
 
           mkdir -p "${BITWARDENCLI_APPDATA_DIR}"
 
-          # Configure the official CLI for the temporary Vaultwarden server.
           "${BW_BIN}" config server "${VAULTWARDEN_BASE_URL}"
 
-          # Authenticate without placing the master password in process arguments.
           BW_SESSION="$("${BW_BIN}" login \
             "${BW_EMAIL}" \
             --passwordenv BW_PASSWORD \
@@ -426,7 +445,6 @@ jobs:
 
           export BW_SESSION
 
-          # Confirm that the CLI is authenticated and unlocked.
           STATUS="$("${BW_BIN}" status --raw)"
 
           if ! echo "${STATUS}" | jq -e '.status == "unlocked"' > /dev/null; then
@@ -434,7 +452,6 @@ jobs:
             exit 1
           fi
 
-          # Import the existing repository fixture.
           CANARY_FIXTURE="${GITHUB_WORKSPACE}/tests/fixtures/vault-canary.json"
 
           if [ ! -f "${CANARY_FIXTURE}" ]; then
@@ -446,7 +463,6 @@ jobs:
 
           "${BW_BIN}" import bitwardenjson "${CANARY_FIXTURE}"
 
-          # Pull the resulting vault state from the server.
           "${BW_BIN}" sync
 
           echo "Canary vault import completed."
@@ -464,7 +480,6 @@ jobs:
           ITEMS_FILE="${RUNNER_TEMP}/canary-items.json"
           FOLDERS_FILE="${RUNNER_TEMP}/canary-folders.json"
 
-          # Retrieve and decrypt the vault using the official CLI.
           "${BW_BIN}" list items --raw > "${ITEMS_FILE}"
           "${BW_BIN}" list folders --raw > "${FOLDERS_FILE}"
 
@@ -517,7 +532,7 @@ jobs:
           echo "Checking imported item contents..."
 
           jq -e '
-            any(.[]; 
+            any(.[];
               .name == "Canary Login" and
               .type == 1 and
               .favorite == true and
@@ -526,19 +541,19 @@ jobs:
               .login.totp != null
             ) and
 
-            any(.[]; 
+            any(.[];
               .name == "Canary Secure Note" and
               .type == 2 and
               (.notes | contains("\n"))
             ) and
 
-            any(.[]; 
+            any(.[];
               .name == "Canary Payment Card" and
               .type == 3 and
               .card.number == "4111111111111111"
             ) and
 
-            any(.[]; 
+            any(.[];
               .name == "Canary Identity" and
               .type == 4 and
               .identity.email == "canary@example.invalid"
@@ -546,15 +561,6 @@ jobs:
           ' "${ITEMS_FILE}" > /dev/null
 
           echo "All canary vault verification checks passed."
-
-          echo "Verified:"
-          echo "- 1 Login"
-          echo "- 1 Secure Note"
-          echo "- 1 Payment Card"
-          echo "- 1 Identity"
-          echo "- 1 Folder"
-          echo "- All four folder assignments"
-          echo "- Selected decrypted item contents"
 
       - name: Collect diagnostics
         if: always()
@@ -599,8 +605,9 @@ jobs:
 
           VAULTWARDEN_TLS_DIR="${RUNNER_TEMP}/vaultwarden-tls"
           DIAGNOSTICS_DIR="${RUNNER_TEMP}/vaultwarden-lifecycle"
+          NSS_DB="${HOME}/.pki/nssdb"
 
-          # Remove the temporary server and its in-memory database.
+          # Remove temporary Vaultwarden container.
           docker rm --force "${VAULTWARDEN_CONTAINER}" 2>/dev/null
 
           # Stop Nginx.
@@ -611,24 +618,33 @@ jobs:
             /etc/nginx/sites-enabled/vaultwarden-lifecycle \
             /etc/nginx/sites-available/vaultwarden-lifecycle
 
-          # Remove the temporary CA from the system trust store.
+          # Remove temporary CA from the system trust store.
           sudo rm -f \
             /usr/local/share/ca-certificates/vaultwarden-lifecycle-ca.crt
 
           sudo update-ca-certificates
 
-          # Remove the temporary hostname entry.
+          # Remove only our temporary CA from Chromium's NSS database.
+          if [ -d "${NSS_DB}" ]; then
+            certutil \
+              -d "sql:${NSS_DB}" \
+              -D \
+              -n "Vaultwarden Lifecycle Test CA" \
+              2>/dev/null || true
+          fi
+
+          # Remove temporary hostname entry.
           sudo sed -i \
             "/${VAULTWARDEN_HOSTNAME//./\\.}/d" \
             /etc/hosts
 
-          # Remove all client profiles, credentials-related state and certificates.
+          # Remove temporary certificates and client profiles.
           rm -rf "${VAULTWARDEN_TLS_DIR}"
           rm -rf "${RUNNER_TEMP}/vaultwarden-cli"
           rm -rf "${RUNNER_TEMP}/vaultwarden-browser-profile"
           rm -rf "${RUNNER_TEMP}/vaultwarden-provisioning"
 
-          # Remove local verification data.
+          # Remove verification data.
           rm -f \
             "${RUNNER_TEMP}/canary-items.json" \
             "${RUNNER_TEMP}/canary-folders.json"
