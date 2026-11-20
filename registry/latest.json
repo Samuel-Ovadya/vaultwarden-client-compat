@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "generated_at": null,
+  "project": "vaultwarden-client-compat",
+  "platforms": {
+    "firefox": {
+      "latest_compatible": null,
+      "upstream_url": null
+    },
+    "linux": {
+      "latest_compatible": null,
+      "upstream_url": null
+    },
+    "windows": {
+      "latest_compatible": null,
+      "upstream_url": null
+    }
+  },
+  "note": "No versions are approved until real compatibility tests have passed."
+}

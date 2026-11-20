@@ -1,0 +1,17 @@
+schema_version: 1
+supported_platforms:
+  - firefox
+  - linux
+  - windows
+
+result_values:
+  - pass
+  - fail
+  - error
+
+rules:
+  unknown_is_compatible: false
+  require_exact_client_server_pair: true
+  require_platform_specific_results: true
+  generate_minimum_server_version_only_for_monotonic_pass_range: true
+  retain_historical_results: true

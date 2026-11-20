@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Compatibility test result",
+  "type": "object",
+  "required": [
+    "client_version",
+    "platform",
+    "vaultwarden_version",
+    "result",
+    "tested_at",
+    "test_suite_revision"
+  ],
+  "properties": {
+    "client_version": {
+      "type": "string"
+    },
+    "platform": {
+      "enum": [
+        "firefox",
+        "linux",
+        "windows"
+      ]
+    },
+    "vaultwarden_version": {
+      "type": "string"
+    },
+    "result": {
+      "enum": [
+        "pass",
+        "fail",
+        "error"
+      ]
+    },
+    "tested_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "test_suite_revision": {
+      "type": "string"
+    },
+    "details": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false
+}
