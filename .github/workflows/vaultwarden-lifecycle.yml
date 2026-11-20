@@ -1,0 +1,111 @@
+
+name: Vaultwarden Lifecycle
+
+on:
+  push:
+    branches:
+      - dev
+    paths:
+      - .github/workflows/vaultwarden-lifecycle.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vaultwarden-lifecycle-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lifecycle:
+    name: Start, verify and clean up Vaultwarden
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      VAULTWARDEN_IMAGE: vaultwarden/server:1.37.5
+      VAULTWARDEN_CONTAINER: vaultwarden-lifecycle
+      VAULTWARDEN_HOST_PORT: "8080"
+
+    steps:
+      - name: Pull Vaultwarden image
+        run: docker pull "$VAULTWARDEN_IMAGE"
+
+      - name: Start temporary Vaultwarden instance
+        run: |
+          docker run \
+            --detach \
+            --name "$VAULTWARDEN_CONTAINER" \
+            --publish "127.0.0.1:${VAULTWARDEN_HOST_PORT}:80" \
+            --tmpfs /data:rw,nosuid,nodev,noexec,size=64m \
+            --env SIGNUPS_ALLOWED=false \
+            "$VAULTWARDEN_IMAGE"
+
+      - name: Wait for Vaultwarden readiness
+        run: |
+          HEALTH_URL="http://127.0.0.1:${VAULTWARDEN_HOST_PORT}/alive"
+
+          echo "Waiting for Vaultwarden at ${HEALTH_URL}"
+
+          for attempt in $(seq 1 60); do
+            if curl \
+              --connect-timeout 2 \
+              --max-time 5 \
+              --fail \
+              --silent \
+              --show-error \
+              "$HEALTH_URL" > /dev/null; then
+
+              echo "Vaultwarden is reachable and its health endpoint succeeded."
+              exit 0
+            fi
+
+            CONTAINER_STATE="$(docker inspect \
+              --format '{{.State.Status}}' \
+              "$VAULTWARDEN_CONTAINER" 2>/dev/null || true)"
+
+            if [ "$CONTAINER_STATE" = "exited" ] || \
+               [ "$CONTAINER_STATE" = "dead" ]; then
+              echo "Vaultwarden stopped unexpectedly."
+              docker logs "$VAULTWARDEN_CONTAINER" || true
+              exit 1
+            fi
+
+            sleep 2
+          done
+
+          echo "Vaultwarden did not become healthy within 120 seconds."
+          exit 1
+
+      - name: Collect diagnostics
+        if: always()
+        run: |
+          DIAGNOSTICS_DIR="${RUNNER_TEMP}/vaultwarden-lifecycle"
+          mkdir -p "$DIAGNOSTICS_DIR"
+
+          if docker inspect "$VAULTWARDEN_CONTAINER" > /dev/null 2>&1; then
+            docker logs --timestamps "$VAULTWARDEN_CONTAINER" \
+              > "$DIAGNOSTICS_DIR/container.log" 2>&1 || true
+
+            docker inspect \
+              --format '{{json .State}}' \
+              "$VAULTWARDEN_CONTAINER" \
+              > "$DIAGNOSTICS_DIR/container-state.json" || true
+          else
+            echo "Vaultwarden container was not created." \
+              > "$DIAGNOSTICS_DIR/container.log"
+          fi
+
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vaultwarden-lifecycle-diagnostics
+          path: ${{ runner.temp }}/vaultwarden-lifecycle/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Cleanup temporary Vaultwarden instance
+        if: always()
+        run: |
+          docker rm --force "$VAULTWARDEN_CONTAINER" || true
