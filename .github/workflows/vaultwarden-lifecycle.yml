@@ -2,12 +2,12 @@
 name: Vaultwarden Lifecycle
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - dev
     paths:
-      - .github/workflows/vaultwarden-lifecycle.yml
-  workflow_dispatch:
+      - ".github/workflows/vaultwarden-lifecycle.yml"
 
 permissions:
   contents: read
@@ -17,103 +17,105 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  lifecycle:
-    name: Start, verify HTTPS and clean up Vaultwarden
+  vaultwarden-lifecycle:
+    name: Ephemeral Vaultwarden HTTPS lifecycle
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 10
 
     env:
       VAULTWARDEN_IMAGE: vaultwarden/server:1.37.5
       VAULTWARDEN_CONTAINER: vaultwarden-lifecycle
       VAULTWARDEN_HOST_PORT: "8080"
       VAULTWARDEN_HOSTNAME: vaultwarden.test
-      VAULTWARDEN_TLS_DIR: ${{ runner.temp }}/vaultwarden-tls
-      DIAGNOSTICS_DIR: ${{ runner.temp }}/vaultwarden-lifecycle
 
     steps:
-      - name: Install Nginx and OpenSSL
+      - name: Install system dependencies
+        shell: bash
         run: |
+          set -Eeuo pipefail
+
           sudo apt-get update
-          sudo apt-get install --yes nginx openssl ca-certificates
+          sudo apt-get install --yes \
+            ca-certificates \
+            curl \
+            nginx \
+            openssl
 
       - name: Generate temporary test CA and server certificate
+        shell: bash
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
 
-          mkdir -p "$VAULTWARDEN_TLS_DIR"
-          chmod 700 "$VAULTWARDEN_TLS_DIR"
+          VAULTWARDEN_TLS_DIR="${RUNNER_TEMP}/vaultwarden-tls"
+          mkdir -p "${VAULTWARDEN_TLS_DIR}"
+          chmod 700 "${VAULTWARDEN_TLS_DIR}"
 
-          cd "$VAULTWARDEN_TLS_DIR"
-
-          # Generate a temporary local certificate authority.
+          # Generate a temporary local CA.
           openssl req \
             -x509 \
-            -newkey rsa:3072 \
+            -newkey rsa:2048 \
             -sha256 \
             -days 1 \
             -nodes \
-            -keyout ca.key \
-            -out ca.crt \
-            -subj "/CN=VWCC Temporary Test CA" \
-            -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
-            -addext "keyUsage=critical,keyCertSign,cRLSign"
+            -keyout "${VAULTWARDEN_TLS_DIR}/ca.key" \
+            -out "${VAULTWARDEN_TLS_DIR}/ca.crt" \
+            -subj "/CN=Vaultwarden Lifecycle Test CA"
 
           # Generate the server private key and certificate request.
           openssl req \
             -new \
             -newkey rsa:2048 \
+            -sha256 \
             -nodes \
-            -keyout server.key \
-            -out server.csr \
+            -keyout "${VAULTWARDEN_TLS_DIR}/server.key" \
+            -out "${VAULTWARDEN_TLS_DIR}/server.csr" \
             -subj "/CN=${VAULTWARDEN_HOSTNAME}"
 
-          # Define server certificate extensions.
-          cat > server.ext <<EOF
-          basicConstraints=critical,CA:FALSE
-          keyUsage=critical,digitalSignature,keyEncipherment
-          extendedKeyUsage=serverAuth
+          # Add the DNS subject alternative name.
+          cat > "${VAULTWARDEN_TLS_DIR}/server.ext" <<EOF
           subjectAltName=DNS:${VAULTWARDEN_HOSTNAME}
+          extendedKeyUsage=serverAuth
+          keyUsage=digitalSignature,keyEncipherment
           EOF
 
           # Sign the server certificate using the temporary CA.
           openssl x509 \
             -req \
-            -in server.csr \
-            -CA ca.crt \
-            -CAkey ca.key \
+            -in "${VAULTWARDEN_TLS_DIR}/server.csr" \
+            -CA "${VAULTWARDEN_TLS_DIR}/ca.crt" \
+            -CAkey "${VAULTWARDEN_TLS_DIR}/ca.key" \
             -CAcreateserial \
-            -out server.crt \
+            -out "${VAULTWARDEN_TLS_DIR}/server.crt" \
             -days 1 \
             -sha256 \
-            -extfile server.ext
+            -extfile "${VAULTWARDEN_TLS_DIR}/server.ext"
 
-          chmod 600 ca.key server.key
+          chmod 600 "${VAULTWARDEN_TLS_DIR}/"*.key
 
-          # Trust the temporary CA inside this runner only.
-          sudo install \
-            -m 0644 \
-            ca.crt \
-            /usr/local/share/ca-certificates/vwcc-test-ca.crt
+          # Install the temporary CA into the runner's system trust store.
+          sudo cp \
+            "${VAULTWARDEN_TLS_DIR}/ca.crt" \
+            /usr/local/share/ca-certificates/vaultwarden-lifecycle-ca.crt
 
           sudo update-ca-certificates
 
-          # Configure the local hostname.
-          echo "127.0.0.1 ${VAULTWARDEN_HOSTNAME}" \
-            | sudo tee -a /etc/hosts
+          # Resolve the test hostname to loopback.
+          echo "127.0.0.1 ${VAULTWARDEN_HOSTNAME}" | sudo tee -a /etc/hosts
 
-      - name: Configure Nginx reverse proxy
+      - name: Configure Nginx HTTPS reverse proxy
+        shell: bash
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
 
-          sudo tee /etc/nginx/sites-available/vaultwarden \
-            > /dev/null <<EOF
+          VAULTWARDEN_TLS_DIR="${RUNNER_TEMP}/vaultwarden-tls"
+
+          sudo tee /etc/nginx/sites-available/vaultwarden-lifecycle > /dev/null <<EOF
           server {
-              listen 443 ssl;
+              listen 127.0.0.1:443 ssl;
               server_name ${VAULTWARDEN_HOSTNAME};
 
               ssl_certificate ${VAULTWARDEN_TLS_DIR}/server.crt;
               ssl_certificate_key ${VAULTWARDEN_TLS_DIR}/server.key;
-
               ssl_protocols TLSv1.2 TLSv1.3;
 
               location / {
@@ -127,113 +129,130 @@ jobs:
 
                   proxy_set_header Upgrade \$http_upgrade;
                   proxy_set_header Connection "upgrade";
-
-                  proxy_read_timeout 3600s;
               }
           }
           EOF
 
-          sudo rm -f /etc/nginx/sites-enabled/default
-
           sudo ln -s \
-            /etc/nginx/sites-available/vaultwarden \
-            /etc/nginx/sites-enabled/vaultwarden
+            /etc/nginx/sites-available/vaultwarden-lifecycle \
+            /etc/nginx/sites-enabled/vaultwarden-lifecycle
+
+          sudo rm -f /etc/nginx/sites-enabled/default
 
           sudo nginx -t
           sudo systemctl restart nginx
 
-      - name: Pull Vaultwarden image
+      - name: Start ephemeral Vaultwarden
+        shell: bash
         run: |
-          docker pull "$VAULTWARDEN_IMAGE"
+          set -Eeuo pipefail
 
-      - name: Start temporary Vaultwarden instance
-        run: |
-          docker run \
-            --detach \
-            --name "$VAULTWARDEN_CONTAINER" \
+          docker pull "${VAULTWARDEN_IMAGE}"
+
+          docker run --detach \
+            --name "${VAULTWARDEN_CONTAINER}" \
             --publish "127.0.0.1:${VAULTWARDEN_HOST_PORT}:80" \
             --tmpfs /data:rw,nosuid,nodev,noexec,size=128m \
             --env DOMAIN="https://${VAULTWARDEN_HOSTNAME}" \
             --env SIGNUPS_ALLOWED=true \
             --env SIGNUPS_VERIFY=false \
-            "$VAULTWARDEN_IMAGE"
+            "${VAULTWARDEN_IMAGE}"
 
-      - name: Wait for Vaultwarden readiness over HTTPS
+      - name: Verify Vaultwarden HTTPS endpoint
+        shell: bash
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
 
-          HEALTH_URL="https://${VAULTWARDEN_HOSTNAME}/alive"
+          BASE_URL="https://${VAULTWARDEN_HOSTNAME}"
 
-          echo "Waiting for Vaultwarden at ${HEALTH_URL}"
+          echo "Waiting for Vaultwarden HTTPS endpoint..."
 
-          for attempt in $(seq 1 60); do
+          for attempt in $(seq 1 30); do
             if curl \
-              --connect-timeout 2 \
-              --max-time 5 \
               --fail \
               --silent \
               --show-error \
-              "$HEALTH_URL" > /dev/null; then
-
-              echo "Vaultwarden HTTPS health check succeeded."
-              exit 0
+              "${BASE_URL}/alive"; then
+              echo
+              break
             fi
 
-            CONTAINER_STATE="$(docker inspect \
-              --format '{{.State.Status}}' \
-              "$VAULTWARDEN_CONTAINER" 2>/dev/null || true)"
-
-            if [ "$CONTAINER_STATE" = "exited" ] || \
-               [ "$CONTAINER_STATE" = "dead" ]; then
-              echo "Vaultwarden stopped unexpectedly."
-              docker logs "$VAULTWARDEN_CONTAINER" || true
+            if [ "${attempt}" -eq 30 ]; then
+              echo "Vaultwarden did not become healthy in time."
               exit 1
             fi
 
             sleep 2
           done
 
-          echo "Vaultwarden did not become healthy within 120 seconds."
-          exit 1
-
-      - name: Verify TLS certificate and hostname
-        run: |
-          set -euo pipefail
+          echo "Checking TLS certificate and hostname..."
 
           openssl s_client \
             -connect 127.0.0.1:443 \
-            -servername "$VAULTWARDEN_HOSTNAME" \
+            -servername "${VAULTWARDEN_HOSTNAME}" \
             -verify_return_error \
-            -verify_hostname "$VAULTWARDEN_HOSTNAME" \
+            -verify_hostname "${VAULTWARDEN_HOSTNAME}" \
             </dev/null
 
-          echo "TLS certificate chain and hostname verification succeeded."
+          echo "Checking HTTPS response..."
+
+          HTTP_STATUS="$(curl \
+            --silent \
+            --output /dev/null \
+            --write-out '%{http_code}' \
+            "${BASE_URL}/alive")"
+
+          if [ "${HTTP_STATUS}" != "200" ]; then
+            echo "Unexpected HTTP status: ${HTTP_STATUS}"
+            exit 1
+          fi
+
+          echo "Vaultwarden HTTPS endpoint is healthy."
+
+      - name: Verify registration endpoint is reachable
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          BASE_URL="https://${VAULTWARDEN_HOSTNAME}"
+
+          HTTP_STATUS="$(curl \
+            --silent \
+            --output /dev/null \
+            --write-out '%{http_code}' \
+            "${BASE_URL}/api/config")"
+
+          echo "Vaultwarden API config HTTP status: ${HTTP_STATUS}"
+
+          if [ "${HTTP_STATUS}" != "200" ]; then
+            echo "Vaultwarden API configuration endpoint is not healthy."
+            exit 1
+          fi
 
       - name: Collect diagnostics
         if: always()
+        shell: bash
         run: |
-          mkdir -p "$DIAGNOSTICS_DIR"
+          set +e
 
-          if docker inspect "$VAULTWARDEN_CONTAINER" \
-            > /dev/null 2>&1; then
+          DIAGNOSTICS_DIR="${RUNNER_TEMP}/vaultwarden-lifecycle"
+          mkdir -p "${DIAGNOSTICS_DIR}"
 
-            docker logs --timestamps "$VAULTWARDEN_CONTAINER" \
-              > "$DIAGNOSTICS_DIR/container.log" 2>&1 || true
+          docker ps -a \
+            > "${DIAGNOSTICS_DIR}/docker-ps.txt" 2>&1
 
-            docker inspect \
-              --format '{{json .State}}' \
-              "$VAULTWARDEN_CONTAINER" \
-              > "$DIAGNOSTICS_DIR/container-state.json" || true
-          else
-            echo "Vaultwarden container was not created." \
-              > "$DIAGNOSTICS_DIR/container.log"
-          fi
+          docker logs "${VAULTWARDEN_CONTAINER}" \
+            > "${DIAGNOSTICS_DIR}/vaultwarden.log" 2>&1
 
-          sudo cp /var/log/nginx/error.log \
-            "$DIAGNOSTICS_DIR/nginx-error.log" 2>/dev/null || true
+          sudo nginx -T \
+            > "${DIAGNOSTICS_DIR}/nginx-config.txt" 2>&1
 
-          sudo cp /var/log/nginx/access.log \
-            "$DIAGNOSTICS_DIR/nginx-access.log" 2>/dev/null || true
+          sudo journalctl -u nginx --no-pager \
+            > "${DIAGNOSTICS_DIR}/nginx-journal.txt" 2>&1
+
+          curl -v \
+            "https://${VAULTWARDEN_HOSTNAME}/alive" \
+            > "${DIAGNOSTICS_DIR}/https-alive.txt" 2>&1
 
       - name: Upload failure diagnostics
         if: failure()
@@ -244,29 +263,31 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      - name: Cleanup temporary environment
+      - name: Cleanup ephemeral environment
         if: always()
+        shell: bash
         run: |
-          echo "Cleaning up temporary Vaultwarden environment."
+          set +e
 
-          docker rm --force "$VAULTWARDEN_CONTAINER" || true
+          VAULTWARDEN_TLS_DIR="${RUNNER_TEMP}/vaultwarden-tls"
+          DIAGNOSTICS_DIR="${RUNNER_TEMP}/vaultwarden-lifecycle"
 
-          sudo systemctl stop nginx || true
+          docker rm --force "${VAULTWARDEN_CONTAINER}" 2>/dev/null
 
-          sudo rm -f \
-            /etc/nginx/sites-enabled/vaultwarden \
-            /etc/nginx/sites-available/vaultwarden
-
-          sudo nginx -t || true
+          sudo systemctl stop nginx 2>/dev/null
 
           sudo rm -f \
-            /usr/local/share/ca-certificates/vwcc-test-ca.crt
+            /etc/nginx/sites-enabled/vaultwarden-lifecycle \
+            /etc/nginx/sites-available/vaultwarden-lifecycle
 
-          sudo update-ca-certificates || true
+          sudo rm -f \
+            /usr/local/share/ca-certificates/vaultwarden-lifecycle-ca.crt
 
-          sudo sed -i '/vaultwarden\.test/d' /etc/hosts
+          sudo update-ca-certificates
 
-          rm -rf "$VAULTWARDEN_TLS_DIR"
-          rm -rf "$DIAGNOSTICS_DIR"
+          sudo sed -i \
+            "/${VAULTWARDEN_HOSTNAME//./\\.}/d" \
+            /etc/hosts
 
-          echo "Cleanup completed."
+          rm -rf "${VAULTWARDEN_TLS_DIR}"
+          rm -rf "${DIAGNOSTICS_DIR}"
