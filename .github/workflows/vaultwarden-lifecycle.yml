@@ -8,6 +8,7 @@ on:
       - dev
     paths:
       - ".github/workflows/vaultwarden-lifecycle.yml"
+      - "tests/fixtures/vault-canary.json"
 
 permissions:
   contents: read
@@ -18,17 +19,29 @@ concurrency:
 
 jobs:
   vaultwarden-lifecycle:
-    name: Ephemeral Vaultwarden HTTPS lifecycle
+    name: Ephemeral Vaultwarden provisioning lifecycle
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 20
 
     env:
       VAULTWARDEN_IMAGE: vaultwarden/server:1.37.5
       VAULTWARDEN_CONTAINER: vaultwarden-lifecycle
       VAULTWARDEN_HOST_PORT: "8080"
       VAULTWARDEN_HOSTNAME: vaultwarden.test
+      VAULTWARDEN_BASE_URL: https://vaultwarden.test
+
+      BW_CLI_VERSION: "2026.11.0"
+      PLAYWRIGHT_VERSION: "1.56.1"
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: Install system dependencies
         shell: bash
         run: |
@@ -38,6 +51,7 @@ jobs:
           sudo apt-get install --yes \
             ca-certificates \
             curl \
+            jq \
             nginx \
             openssl
 
@@ -47,6 +61,7 @@ jobs:
           set -Eeuo pipefail
 
           VAULTWARDEN_TLS_DIR="${RUNNER_TEMP}/vaultwarden-tls"
+
           mkdir -p "${VAULTWARDEN_TLS_DIR}"
           chmod 700 "${VAULTWARDEN_TLS_DIR}"
 
@@ -153,7 +168,7 @@ jobs:
             --name "${VAULTWARDEN_CONTAINER}" \
             --publish "127.0.0.1:${VAULTWARDEN_HOST_PORT}:80" \
             --tmpfs /data:rw,nosuid,nodev,noexec,size=128m \
-            --env DOMAIN="https://${VAULTWARDEN_HOSTNAME}" \
+            --env DOMAIN="${VAULTWARDEN_BASE_URL}" \
             --env SIGNUPS_ALLOWED=true \
             --env SIGNUPS_VERIFY=false \
             "${VAULTWARDEN_IMAGE}"
@@ -163,8 +178,6 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          BASE_URL="https://${VAULTWARDEN_HOSTNAME}"
-
           echo "Waiting for Vaultwarden HTTPS endpoint..."
 
           for attempt in $(seq 1 30); do
@@ -172,7 +185,7 @@ jobs:
               --fail \
               --silent \
               --show-error \
-              "${BASE_URL}/alive"; then
+              "${VAULTWARDEN_BASE_URL}/alive"; then
               echo
               break
             fi
@@ -200,7 +213,7 @@ jobs:
             --silent \
             --output /dev/null \
             --write-out '%{http_code}' \
-            "${BASE_URL}/alive")"
+            "${VAULTWARDEN_BASE_URL}/alive")"
 
           if [ "${HTTP_STATUS}" != "200" ]; then
             echo "Unexpected HTTP status: ${HTTP_STATUS}"
@@ -209,25 +222,339 @@ jobs:
 
           echo "Vaultwarden HTTPS endpoint is healthy."
 
-      - name: Verify registration endpoint is reachable
+      - name: Verify Web Vault and API availability
         shell: bash
         run: |
           set -Eeuo pipefail
 
-          BASE_URL="https://${VAULTWARDEN_HOSTNAME}"
-
-          HTTP_STATUS="$(curl \
+          # The official Web Vault must be served by Vaultwarden.
+          WEB_STATUS="$(curl \
             --silent \
             --output /dev/null \
             --write-out '%{http_code}' \
-            "${BASE_URL}/api/config")"
+            "${VAULTWARDEN_BASE_URL}/")"
 
-          echo "Vaultwarden API config HTTP status: ${HTTP_STATUS}"
-
-          if [ "${HTTP_STATUS}" != "200" ]; then
-            echo "Vaultwarden API configuration endpoint is not healthy."
+          if [ "${WEB_STATUS}" != "200" ]; then
+            echo "Web Vault is unavailable: HTTP ${WEB_STATUS}"
             exit 1
           fi
+
+          API_STATUS="$(curl \
+            --silent \
+            --output /dev/null \
+            --write-out '%{http_code}' \
+            "${VAULTWARDEN_BASE_URL}/api/config")"
+
+          if [ "${API_STATUS}" != "200" ]; then
+            echo "Vaultwarden API is unavailable: HTTP ${API_STATUS}"
+            exit 1
+          fi
+
+          echo "Web Vault and API are available."
+
+      - name: Generate disposable account credentials
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          # Credentials exist only on this GitHub-hosted runner.
+          BW_EMAIL="canary-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$(openssl rand -hex 4)@example.invalid"
+          BW_PASSWORD="Aa1!$(openssl rand -hex 24)"
+
+          # Prevent accidental disclosure in GitHub Actions logs.
+          echo "::add-mask::${BW_EMAIL}"
+          echo "::add-mask::${BW_PASSWORD}"
+
+          {
+            echo "BW_EMAIL=${BW_EMAIL}"
+            echo "BW_PASSWORD=${BW_PASSWORD}"
+          } >> "${GITHUB_ENV}"
+
+          echo "Disposable account credentials generated."
+
+      - name: Install pinned provisioning tools
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          PROVISIONING_DIR="${RUNNER_TEMP}/vaultwarden-provisioning"
+
+          mkdir -p "${PROVISIONING_DIR}"
+
+          # Install exact versions of the official CLI and Playwright.
+          npm install \
+            --prefix "${PROVISIONING_DIR}" \
+            --no-save \
+            "@bitwarden/cli@${BW_CLI_VERSION}" \
+            "playwright@${PLAYWRIGHT_VERSION}"
+
+          BW_BIN="${PROVISIONING_DIR}/node_modules/.bin/bw"
+
+          echo "Installed Bitwarden CLI version:"
+          "${BW_BIN}" --version
+
+          echo "Installing Chromium and its system dependencies..."
+
+          "${PROVISIONING_DIR}/node_modules/.bin/playwright" \
+            install --with-deps chromium
+
+      - name: Register disposable account through Web Vault
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          PROVISIONING_DIR="${RUNNER_TEMP}/vaultwarden-provisioning"
+
+          export BROWSER_PROFILE_DIR="${RUNNER_TEMP}/vaultwarden-browser-profile"
+
+          cat > "${PROVISIONING_DIR}/register.mjs" <<'EOF'
+          import { chromium } from 'playwright';
+
+          const baseUrl = process.env.VAULTWARDEN_BASE_URL;
+          const email = process.env.BW_EMAIL;
+          const password = process.env.BW_PASSWORD;
+          const profileDir = process.env.BROWSER_PROFILE_DIR;
+
+          if (!baseUrl || !email || !password || !profileDir) {
+            throw new Error('Missing registration configuration.');
+          }
+
+          const context = await chromium.launchPersistentContext(
+            profileDir,
+            {
+              headless: true
+            }
+          );
+
+          try {
+            const page = await context.newPage();
+
+            console.log('Opening official Bitwarden Web Vault...');
+
+            await page.goto(`${baseUrl}/#/register`, {
+              waitUntil: 'domcontentloaded'
+            });
+
+            // Wait for the registration interface.
+            const emailInput = page.locator(
+              'input[type="email"], input[autocomplete="email"]'
+            ).first();
+
+            const passwordInputs = page.locator(
+              'input[type="password"]'
+            );
+
+            await emailInput.waitFor({
+              state: 'visible',
+              timeout: 30000
+            });
+
+            if (await passwordInputs.count() < 2) {
+              throw new Error(
+                'Expected registration password and confirmation inputs.'
+              );
+            }
+
+            await emailInput.fill(email);
+            await passwordInputs.nth(0).fill(password);
+            await passwordInputs.nth(1).fill(password);
+
+            // Observe the actual registration API response.
+            const registrationResponsePromise = page.waitForResponse(
+              response =>
+                new URL(response.url()).pathname.endsWith(
+                  '/api/accounts/register'
+                ) &&
+                response.request().method() === 'POST',
+              { timeout: 60000 }
+            );
+
+            const submitButton = page.locator(
+              'button[type="submit"]'
+            ).last();
+
+            await submitButton.click();
+
+            const registrationResponse =
+              await registrationResponsePromise;
+
+            if (!registrationResponse.ok()) {
+              throw new Error(
+                `Account registration failed: HTTP ${registrationResponse.status()}`
+              );
+            }
+
+            console.log(
+              'Disposable account successfully registered through Web Vault.'
+            );
+
+          } finally {
+            await context.close();
+          }
+          EOF
+
+          node "${PROVISIONING_DIR}/register.mjs"
+
+      - name: Authenticate and import canary vault using Bitwarden CLI
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          PROVISIONING_DIR="${RUNNER_TEMP}/vaultwarden-provisioning"
+          BW_BIN="${PROVISIONING_DIR}/node_modules/.bin/bw"
+
+          export BITWARDENCLI_APPDATA_DIR="${RUNNER_TEMP}/vaultwarden-cli"
+
+          mkdir -p "${BITWARDENCLI_APPDATA_DIR}"
+
+          # Configure the official CLI for the temporary Vaultwarden server.
+          "${BW_BIN}" config server "${VAULTWARDEN_BASE_URL}"
+
+          # Authenticate without placing the master password in process arguments.
+          BW_SESSION="$("${BW_BIN}" login \
+            "${BW_EMAIL}" \
+            --passwordenv BW_PASSWORD \
+            --nointeraction \
+            --raw)"
+
+          if [ -z "${BW_SESSION}" ]; then
+            echo "Bitwarden CLI authentication did not return a session."
+            exit 1
+          fi
+
+          echo "::add-mask::${BW_SESSION}"
+
+          export BW_SESSION
+
+          # Confirm that the CLI is authenticated and unlocked.
+          STATUS="$("${BW_BIN}" status --raw)"
+
+          if ! echo "${STATUS}" | jq -e '.status == "unlocked"' > /dev/null; then
+            echo "Bitwarden CLI is not unlocked."
+            exit 1
+          fi
+
+          # Import the existing repository fixture.
+          CANARY_FIXTURE="${GITHUB_WORKSPACE}/tests/fixtures/vault-canary.json"
+
+          if [ ! -f "${CANARY_FIXTURE}" ]; then
+            echo "Canary fixture not found: ${CANARY_FIXTURE}"
+            exit 1
+          fi
+
+          echo "Importing canary vault through the official Bitwarden CLI..."
+
+          "${BW_BIN}" import bitwardenjson "${CANARY_FIXTURE}"
+
+          # Pull the resulting vault state from the server.
+          "${BW_BIN}" sync
+
+          echo "Canary vault import completed."
+
+      - name: Verify imported canary vault
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          PROVISIONING_DIR="${RUNNER_TEMP}/vaultwarden-provisioning"
+          BW_BIN="${PROVISIONING_DIR}/node_modules/.bin/bw"
+
+          export BITWARDENCLI_APPDATA_DIR="${RUNNER_TEMP}/vaultwarden-cli"
+
+          ITEMS_FILE="${RUNNER_TEMP}/canary-items.json"
+          FOLDERS_FILE="${RUNNER_TEMP}/canary-folders.json"
+
+          # Retrieve and decrypt the vault using the official CLI.
+          "${BW_BIN}" list items --raw > "${ITEMS_FILE}"
+          "${BW_BIN}" list folders --raw > "${FOLDERS_FILE}"
+
+          echo "Checking item counts and types..."
+
+          jq -e '
+            length == 4 and
+            ([.[] | select(.type == 1)] | length) == 1 and
+            ([.[] | select(.type == 2)] | length) == 1 and
+            ([.[] | select(.type == 3)] | length) == 1 and
+            ([.[] | select(.type == 4)] | length) == 1
+          ' "${ITEMS_FILE}" > /dev/null
+
+          echo "Checking expected item names..."
+
+          jq -e '
+            ([.[].name] | sort) == [
+              "Canary Identity",
+              "Canary Login",
+              "Canary Payment Card",
+              "Canary Secure Note"
+            ]
+          ' "${ITEMS_FILE}" > /dev/null
+
+          echo "Checking folder..."
+
+          jq -e '
+            length == 1 and
+            any(.[]; .name == "Compatibility Test Folder")
+          ' "${FOLDERS_FILE}" > /dev/null
+
+          FOLDER_ID="$(jq -r '
+            .[] |
+            select(.name == "Compatibility Test Folder") |
+            .id
+          ' "${FOLDERS_FILE}")"
+
+          if [ -z "${FOLDER_ID}" ] || [ "${FOLDER_ID}" = "null" ]; then
+            echo "Expected folder was not imported."
+            exit 1
+          fi
+
+          echo "Checking folder assignments..."
+
+          jq -e --arg folder_id "${FOLDER_ID}" '
+            length == 4 and
+            all(.[]; .folderId == $folder_id)
+          ' "${ITEMS_FILE}" > /dev/null
+
+          echo "Checking imported item contents..."
+
+          jq -e '
+            any(.[]; 
+              .name == "Canary Login" and
+              .type == 1 and
+              .favorite == true and
+              .login.username == "canary-user" and
+              .login.password == "Synthetic-Password-123!" and
+              .login.totp != null
+            ) and
+
+            any(.[]; 
+              .name == "Canary Secure Note" and
+              .type == 2 and
+              (.notes | contains("\n"))
+            ) and
+
+            any(.[]; 
+              .name == "Canary Payment Card" and
+              .type == 3 and
+              .card.number == "4111111111111111"
+            ) and
+
+            any(.[]; 
+              .name == "Canary Identity" and
+              .type == 4 and
+              .identity.email == "canary@example.invalid"
+            )
+          ' "${ITEMS_FILE}" > /dev/null
+
+          echo "All canary vault verification checks passed."
+
+          echo "Verified:"
+          echo "- 1 Login"
+          echo "- 1 Secure Note"
+          echo "- 1 Payment Card"
+          echo "- 1 Identity"
+          echo "- 1 Folder"
+          echo "- All four folder assignments"
+          echo "- Selected decrypted item contents"
 
       - name: Collect diagnostics
         if: always()
@@ -236,6 +563,7 @@ jobs:
           set +e
 
           DIAGNOSTICS_DIR="${RUNNER_TEMP}/vaultwarden-lifecycle"
+
           mkdir -p "${DIAGNOSTICS_DIR}"
 
           docker ps -a \
@@ -251,7 +579,7 @@ jobs:
             > "${DIAGNOSTICS_DIR}/nginx-journal.txt" 2>&1
 
           curl -v \
-            "https://${VAULTWARDEN_HOSTNAME}/alive" \
+            "${VAULTWARDEN_BASE_URL}/alive" \
             > "${DIAGNOSTICS_DIR}/https-alive.txt" 2>&1
 
       - name: Upload failure diagnostics
@@ -272,22 +600,39 @@ jobs:
           VAULTWARDEN_TLS_DIR="${RUNNER_TEMP}/vaultwarden-tls"
           DIAGNOSTICS_DIR="${RUNNER_TEMP}/vaultwarden-lifecycle"
 
+          # Remove the temporary server and its in-memory database.
           docker rm --force "${VAULTWARDEN_CONTAINER}" 2>/dev/null
 
+          # Stop Nginx.
           sudo systemctl stop nginx 2>/dev/null
 
+          # Remove temporary Nginx configuration.
           sudo rm -f \
             /etc/nginx/sites-enabled/vaultwarden-lifecycle \
             /etc/nginx/sites-available/vaultwarden-lifecycle
 
+          # Remove the temporary CA from the system trust store.
           sudo rm -f \
             /usr/local/share/ca-certificates/vaultwarden-lifecycle-ca.crt
 
           sudo update-ca-certificates
 
+          # Remove the temporary hostname entry.
           sudo sed -i \
             "/${VAULTWARDEN_HOSTNAME//./\\.}/d" \
             /etc/hosts
 
+          # Remove all client profiles, credentials-related state and certificates.
           rm -rf "${VAULTWARDEN_TLS_DIR}"
+          rm -rf "${RUNNER_TEMP}/vaultwarden-cli"
+          rm -rf "${RUNNER_TEMP}/vaultwarden-browser-profile"
+          rm -rf "${RUNNER_TEMP}/vaultwarden-provisioning"
+
+          # Remove local verification data.
+          rm -f \
+            "${RUNNER_TEMP}/canary-items.json" \
+            "${RUNNER_TEMP}/canary-folders.json"
+
           rm -rf "${DIAGNOSTICS_DIR}"
+
+          echo "Temporary Vaultwarden environment cleaned up."
