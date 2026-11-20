@@ -4,20 +4,41 @@
 Platform-specific end-to-end tests will live here.
 
 The first implementation step establishes validation of persisted
-compatibility results before any automated workflow is allowed
-to consume or publish them.
+compatibility results and synthetic vault import fixtures before
+automated workflows are allowed to consume or publish them.
 
-Run the validation unit tests from the repository root:
+## Setup
+
+Install the locked development dependencies from the repository root:
 
 ```bash
-python -m pip install -r requirements-dev.txt
-python -m unittest discover -s tests -v
+uv sync --locked
+```
+
+## Run tests
+
+Run all unit tests:
+
+```bash
+uv run python -m unittest discover -s tests -v
 ```
 
 Validate the current registry history:
 
 ```bash
-python scripts/validate_results.py
+uv run python scripts/validate_results.py
+```
+
+The synthetic Bitwarden vault import fixture is located at:
+
+```text
+tests/fixtures/vault-canary.json
+```
+
+Its structure is validated by:
+
+```text
+tests/test_validate_canary_fixture.py
 ```
 
 Never use personal Bitwarden accounts, real vault data,

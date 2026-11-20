@@ -43,9 +43,7 @@
         "password": "Synthetic-Password-123!",
         "totp": "otpauth://totp/Compatibility:canary?secret=JBSWY3DPEHPK3PXP"
       },
-      "collectionIds": [
-        null
-      ]
+      "collectionIds": null
     },
     {
       "id": "33333333-3333-4333-8333-333333333333",
@@ -65,9 +63,7 @@
       "secureNote": {
         "type": 0
       },
-      "collectionIds": [
-        null
-      ]
+      "collectionIds": null
     },
     {
       "id": "44444444-4444-4444-8444-444444444444",
@@ -92,9 +88,7 @@
         "expYear": "2030",
         "code": "123"
       },
-      "collectionIds": [
-        null
-      ]
+      "collectionIds": null
     },
     {
       "id": "55555555-5555-4555-8555-555555555555",
@@ -131,9 +125,7 @@
         "passportNumber": "CANARY000",
         "licenseNumber": "CANARY000"
       },
-      "collectionIds": [
-        null
-      ]
+      "collectionIds": null
     }
   ]
 }
